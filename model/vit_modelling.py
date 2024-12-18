@@ -4,6 +4,8 @@ import torch.nn.functional as F
 from einops import reduce, rearrange, repeat
 from einops.layers.torch import Rearrange, Reduce
 
+from model.differential_attention import DifferentialAttention
+
 
 class CLSToken(nn.Module):
     def __init__(self, dim):
@@ -31,11 +33,10 @@ class PositionalEncoding(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, dim, num_heads, dropout=0.0, scaling=True):
+    def __init__(self, dim, num_heads, dropout=0.0):
         super().__init__()
         self.num_heads = num_heads
         self.dropout = nn.Dropout(dropout)
-        self.scaling = scaling
 
         self.queries_keys_values = nn.Linear(dim, 3*dim)
         self.projection = nn.Linear(dim, dim)
@@ -47,8 +48,7 @@ class MultiHeadAttention(nn.Module):
 
         attention = torch.einsum('bhqd, bhkd -> bhqk', queries, keys)
         attention = nn.functional.softmax(attention, dim=-1)
-        if self.scaling:
-            attention = attention / (self.embedding_dim**0.5)
+        attention = attention / (self.embedding_dim**0.5)
 
         attention = self.dropout(attention)
 
@@ -70,9 +70,22 @@ class MLP(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, dim, num_heads, dropout=0.0, expansion_factor=4, scaling=True):
+    def __init__(self, dim, num_heads, dropout=0.0, expansion_factor=4):
         super().__init__()
-        self.attention = MultiHeadAttention(dim, num_heads, dropout, scaling)
+        self.attention = MultiHeadAttention(dim, num_heads, dropout)
+        self.mlp = MLP(dim, expansion_factor)
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+    
+    def forward(self, x):
+        x = x + self.norm1(self.attention(x))
+        return x + self.norm2(self.mlp(x))
+
+
+class DiffAttnTransformerBlock(nn.Module):
+    def __init__(self, dim, num_heads, layer_num, expansion_factor=4):
+        super().__init__()
+        self.attention = DifferentialAttention(dim, num_heads, layer_num)
         self.mlp = MLP(dim, expansion_factor)
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
@@ -83,19 +96,79 @@ class TransformerBlock(nn.Module):
 
 
 class VanillaViT(nn.Module):
-    def __init__(self):
-        pass
+    def __init__(self, num_classes, image_size, patch_size, dim, num_layers, num_heads, dropout=0.0, expansion_factor=4):
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.position_encoding = nn.Parameter(torch.randn(1, (image_size // patch_size)**2+1, dim))
+        self.patch_embed = nn.Conv2d(3, dim, patch_size, patch_size)
+        
+        self.transformer = nn.Sequential(*[TransformerBlock(dim, num_heads, dropout, expansion_factor) for _ in range(num_layers)])
+        self.head = nn.Linear(dim, num_classes)
+        
+        self.config = None
 
-    def forward(self, x):
-        pass
+    def forward(self, x, return_embedding=False):
+        # shape: [B, D, N, N]
+        x = self.patch_embed(x)
+        
+        # shape: [B, N*N, D]
+        x = rearrange(x, "b d n n -> b (n n) d", b=x.shape[0], d=x.shape[1], n=x.shape[2])
+        
+        cls_tokens = repeat(self.cls_token, '() n e -> b n e', b=x.shape[0])
+        
+        # shape: [B, N*N+1, D]
+        x = torch.cat([x, cls_tokens], dim=1)
+        x = x + repeat(self.position_encoding, "() n d -> b n d", b=x.shape[0])
+
+        x = self.transformer(x)
+
+        # shape: [B, D]
+        embedding = x[:, 0, :]
+
+        # shape: [B, C]
+        out = self.head(embedding)
+
+        if return_embedding:
+            return out, embedding
+        
+        return out
 
 
 class DiffAttnViT(nn.Module):
-    def __init__(self):
-        pass
+    def __init__(self, num_classes, image_size, patch_size, dim, num_layers, num_heads, dropout=0.0, expansion_factor=4):
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.position_encoding = nn.Parameter(torch.randn(1, (image_size // patch_size)**2+1, dim))
+        self.patch_embed = nn.Conv2d(3, dim, patch_size, patch_size)
+        
+        self.transformer = nn.Sequential(*[DiffAttnTransformerBlock(dim, num_heads, layer_num=i) for i in range(num_layers)])
+        self.head = nn.Linear(dim, num_classes)
 
-    def forward(self, x):
-        pass
+        self.config = None
+
+    def forward(self, x, return_embedding=False):
+        # shape: [B, D, N, N]
+        x = self.patch_embed(x)
+        
+        # shape: [B, N*N, D]
+        x = rearrange(x, "b d n n -> b (n n) d", b=x.shape[0], d=x.shape[1], n=x.shape[2])
+        
+        cls_tokens = repeat(self.cls_token, '() n e -> b n e', b=x.shape[0])
+        
+        # shape: [B, N*N+1, D]
+        x = torch.cat([x, cls_tokens], dim=1)
+        x = x + repeat(self.position_encoding, "() n d -> b n d", b=x.shape[0])
+
+        x = self.transformer(x)
+
+        # shape: [B, D]
+        embedding = x[:, 0, :]
+
+        # shape: [B, C]
+        out = self.head(embedding)
+
+        if return_embedding:
+            return out, embedding
+        
+        return out
 
 
 class nViT(nn.Module):
